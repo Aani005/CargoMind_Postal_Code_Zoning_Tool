@@ -13,6 +13,7 @@
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/MarkerCluster.css"/>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/MarkerCluster.Default.css"/>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/leaflet.markercluster.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.heat/0.2.0/leaflet-heat.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Outfit:wght@400;600;800&display=swap" rel="stylesheet">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -1165,53 +1166,72 @@ async function autoLoadData(){
   }
 }
 
-// Load all postal data into memory (FAST — no per-point map markers).
-// City Search + City Zoning + draw-selection all run off this data.
+// Load ALL postal data into memory. Map shows a HEATMAP when zoomed out and
+// real individual dots (viewport-bounded) when zoomed in. Selection & export
+// always use the full dataset at original fidelity.
+let canvasRenderer = null;   // canvas renderer for visible dots
+let dotsLayer      = null;   // holds the currently-visible dot markers
+let heatLayer      = null;   // density heatmap (zoomed-out view)
+const DOT_ZOOM_MIN = 9;      // at/above this zoom -> show dots; below -> heatmap
+let viewportRenderScheduled = false;
+
 function autoLoadAllProvinces(){
   return new Promise((resolve)=>{
     const codes = Object.keys(fullData).filter(c=>fullData[c] && fullData[c].length);
     if(!codes.length){ resolve(); return; }
 
-    // Switch UI straight to the map/results view
     document.getElementById('uploadPanel').style.display='none';
     document.getElementById('provPanel').style.display='none';
     document.getElementById('resultsPanel').style.display='flex';
     document.getElementById('toolbar').style.display='flex';
 
+    canvasRenderer = L.canvas({ padding: 0.3 });
+    dotsLayer = L.layerGroup().addTo(map);
+
     allPts = [];
     loadedProvs = {};
     let ci = 0;
+    let skipped = 0;
+
+    function finish(){
+      rebuildAllPts();
+      buildHeatLayer();
+      const sp=document.getElementById('spill');
+      countUpPill(sp, allPts.length, ' postal codes');
+      sp.classList.add('on');
+      try{ map.setView([56,-96],4); }catch(e){}
+      hideLoad();
+      // react to pan/zoom
+      map.on('moveend zoomend', scheduleViewportRender);
+      updateMapDisplay();
+      const sk = skipped ? ` (${skipped.toLocaleString()} had no valid coordinates)` : '';
+      tip('All '+allPts.length.toLocaleString()+' postal codes loaded'+sk+' — zoom in for exact dots, draw to select');
+      renderList([]);
+      resolve();
+    }
 
     function nextProv(){
-      if(ci >= codes.length){
-        rebuildAllPts();
-        const sp=document.getElementById('spill');
-        countUpPill(sp, allPts.length, ' postal codes');
-        sp.classList.add('on');
-        try{ map.setView([56,-96],4); }catch(e){}
-        hideLoad();
-        tip('Data ready — use 🔍 City Search to build city zones, or draw a shape');
-        renderList([]);
-        resolve();
-        return;
-      }
+      if(ci >= codes.length){ finish(); return; }
       const code = codes[ci++];
       const rows = fullData[code];
-      setAutoStatus('Indexing '+code+'…', (ci)+' / '+codes.length+' provinces', 90+(ci/codes.length)*10, '🧮');
+      setAutoStatus('Indexing '+code+'…', (ci)+' / '+codes.length+' provinces · '+allPts.length.toLocaleString()+' points', 70+(ci/codes.length)*30, '🧮');
       const pts = [];
       let i = 0;
-      const CHUNK = 20000;
+      const CHUNK = 25000;
       function chunk(){
         const end = Math.min(i+CHUNK, rows.length);
         for(; i<end; i++){
           const row = rows[i];
           let lat,lng;
-          try{ const r=toLL(row.rawX,row.rawY); lat=r.lat; lng=r.lng; }catch(e){ continue; }
-          if(isNaN(lat)||isNaN(lng)||lat<40||lat>85||lng<-145||lng>-50) continue;
-          if(!row.pc || row.pc.length<3) continue;
+          try{ const r=toLL(row.rawX,row.rawY); lat=r.lat; lng=r.lng; }catch(e){ skipped++; continue; }
+          if(isNaN(lat)||isNaN(lng)){ skipped++; continue; }   // only skip genuinely unplottable rows
           const zone = row.zone || zoneSheetLookup[row.pc] || '';
+          if(zone && !zoneColors[zone]){
+            const cidx = Object.keys(zoneColors).length % ZONE_PALETTE.length;
+            zoneColors[zone] = ZONE_PALETTE[cidx];
+          }
           pts.push({
-            pc:row.pc, fsa:row.pc.substring(0,3), prov:code,
+            pc:row.pc, pcRaw:(row.pcRaw||row.pc), fsa:(row.pc||'').substring(0,3), prov:code,
             city:row.city, cnt:row.cnt, lat, lng,
             m:null, sel:false, zone, zoneSource:row.zoneSource||''
           });
@@ -1223,6 +1243,80 @@ function autoLoadAllProvinces(){
     }
     nextProv();
   });
+}
+
+// Build the density heatmap from every point (cheap: just coordinate array)
+function buildHeatLayer(){
+  if(heatLayer){ try{ map.removeLayer(heatLayer); }catch(e){} heatLayer=null; }
+  if(typeof L.heatLayer !== 'function') return;  // plugin missing -> dots only
+  const heatPts = allPts.map(p=>[p.lat, p.lng, 0.5]);
+  heatLayer = L.heatLayer(heatPts, {
+    radius: 12, blur: 18, maxZoom: 12, minOpacity: 0.35,
+    gradient: {0.2:'#1d4ed8', 0.4:'#06b6d4', 0.6:'#eab308', 0.8:'#f97316', 1.0:'#ef4444'}
+  });
+}
+
+function scheduleViewportRender(){
+  if(viewportRenderScheduled) return;
+  viewportRenderScheduled = true;
+  requestAnimationFrame(()=>{ viewportRenderScheduled=false; updateMapDisplay(); });
+}
+
+// Decide heatmap vs dots based on zoom, and (for dots) render only what's on screen.
+function updateMapDisplay(){
+  if(!allPts.length) return;
+  const z = map.getZoom();
+  if(z < DOT_ZOOM_MIN){
+    // heatmap mode
+    if(dotsLayer) dotsLayer.clearLayers();
+    if(heatLayer && !map.hasLayer(heatLayer)) map.addLayer(heatLayer);
+  } else {
+    // dot mode — remove heat, draw only visible points
+    if(heatLayer && map.hasLayer(heatLayer)) map.removeLayer(heatLayer);
+    renderVisibleDots();
+  }
+}
+
+let _lastDotKey = '';
+function renderVisibleDots(){
+  const b = map.getBounds().pad(0.15);
+  const s=b.getSouth(), n=b.getNorth(), w=b.getWest(), e=b.getEast();
+  // cheap cache key so we don't rebuild if view barely changed
+  const key = [Math.round(s*50),Math.round(n*50),Math.round(w*50),Math.round(e*50)].join(',');
+  if(key===_lastDotKey) return;
+  _lastDotKey = key;
+
+  dotsLayer.clearLayers();
+  let shown=0;
+  const HARD_CAP = 60000; // safety: never draw more than this at once
+  for(let i=0;i<allPts.length;i++){
+    const p=allPts[i];
+    if(p.lat<s||p.lat>n||p.lng<w||p.lng>e) { p.m=null; continue; }
+    const baseCol = (p.zone && zoneColors[p.zone]) ? zoneColors[p.zone] : '#f97316';
+    const col = p.sel ? '#ef4444' : baseCol;
+    const m = L.circleMarker([p.lat,p.lng], {
+      renderer: canvasRenderer, radius: p.sel?5:3.4, fillColor:col,
+      color:'#fff', weight: p.sel?1:0.4, fillOpacity:0.9
+    });
+    m.bindTooltip(`<b>${p.pcRaw}</b>${p.zone?` · Zone ${p.zone}`:''}`, {sticky:true, direction:'top', offset:[0,-4]});
+    (function(pp){
+      m.on('click', function(ev){
+        L.popup({maxWidth:260,className:'pc-popup',closeButton:true,autoPan:true})
+          .setLatLng(ev.latlng)
+          .setContent(`<div class="pc-popup-inner">
+            <div class="pc-popup-code">${pp.pcRaw}</div>
+            <div class="pc-popup-row">FSA: <b>${pp.fsa}</b></div>
+            ${pp.zone?`<div class="pc-popup-row">Zone: <b style="color:${(pp.zone&&zoneColors[pp.zone])||'#f97316'}">${pp.zone}</b></div>`:''}
+            <div class="pc-popup-row pc-popup-city">${pp.city?pp.city+', ':''}<b>${pp.prov}</b>${pp.cnt?' · '+pp.cnt.toLocaleString()+' addr':''}</div>
+          </div>`)
+          .openOn(map);
+        L.DomEvent.stopPropagation(ev);
+      });
+    })(p);
+    p.m = m;
+    dotsLayer.addLayer(m);
+    if(++shown >= HARD_CAP) break;
+  }
 }
 
 // Auto variant of doLoadProvince: renders ALL rows (no sampling cap),
@@ -1592,7 +1686,8 @@ function onData(data,name){
     if(!prov){skip++;return;}
     if(!fullData[prov]) fullData[prov]=[];
     fullData[prov].push({
-      pc:   String(row[cPC]||'').trim().toUpperCase().replace(/\s/g,''),
+      pc:    String(row[cPC]||'').trim().toUpperCase().replace(/\s/g,''),   // normalized for matching
+      pcRaw: String(row[cPC]||'').trim(),                                   // EXACT original from file
       prov,
       city: String(row[cCity]||'').trim(),
       rawX: parseFloat(row[cLng]||row[cX]||0),
@@ -2888,7 +2983,7 @@ function exportCutZones(type){
   ordered.forEach(z=>{
     const pts = ringPtsForCutZone(z);
     pts.forEach(p=>{
-      rows.push([z.label,p.pc,p.fsa,p.prov,p.city,p.lat.toFixed(6),p.lng.toFixed(6),p.cnt||'']);
+      rows.push([z.label,p.pcRaw||p.pc,p.fsa,p.prov,p.city,p.lat.toFixed(6),p.lng.toFixed(6),p.cnt||'']);
       total++;
     });
     summary.push('Zone '+z.label+': '+pts.length.toLocaleString()+' codes');
@@ -2907,24 +3002,53 @@ function exportCutZones(type){
 function compute(){
   if(!drawnLayer)return;
   selPts=[];
-  allPts.forEach(p=>{
-    const ll=L.latLng(p.lat,p.lng);
-    const ins=drawnLayer instanceof L.Circle
-      ?drawnLayer.getLatLng().distanceTo(ll)<=drawnLayer.getRadius()
-      :ptInPoly(ll,drawnLayer);
-    p.sel=ins;
-    if(ins)selPts.push(p);
-    if(p.m){
-      const baseCol = (p.zone && zoneColors[p.zone]) ? zoneColors[p.zone] : '#f97316';
-      p.m.setStyle({fillColor:ins?'#ef4444':baseCol,fillOpacity:ins?0.95:0.78,radius:ins?5.5:3.5,weight:ins?1.2:0.8});
+  const isCircle = drawnLayer instanceof L.Circle;
+  let cLat, cLng, cR, cosLat, mPerDegLat=111320;
+  let bounds, polyPts;
+  if(isCircle){
+    const c = drawnLayer.getLatLng();
+    cLat=c.lat; cLng=c.lng; cR=drawnLayer.getRadius();
+    cosLat = Math.cos(cLat*Math.PI/180);
+  } else {
+    bounds = drawnLayer.getBounds();
+    polyPts = drawnLayer.getLatLngs(); if(Array.isArray(polyPts[0])) polyPts=polyPts[0];
+  }
+
+  for(let i=0;i<allPts.length;i++){
+    const p=allPts[i];
+    let ins;
+    if(isCircle){
+      // fast equirectangular approximation (meters) — avoids trig per point
+      const dLat=(p.lat-cLat)*mPerDegLat;
+      const dLng=(p.lng-cLng)*mPerDegLat*cosLat;
+      ins = (dLat*dLat + dLng*dLng) <= cR*cR;
+    } else {
+      // bbox reject first, then ray cast
+      if(p.lat<bounds.getSouth()||p.lat>bounds.getNorth()||p.lng<bounds.getWest()||p.lng>bounds.getEast()){
+        ins=false;
+      } else {
+        let inside=false; const x=p.lat,y=p.lng;
+        for(let a=0,bb=polyPts.length-1;a<polyPts.length;bb=a++){
+          const xi=polyPts[a].lat,yi=polyPts[a].lng,xj=polyPts[bb].lat,yj=polyPts[bb].lng;
+          if(((yi>y)!==(yj>y))&&(x<(xj-xi)*(y-yi)/(yj-yi)+xi))inside=!inside;
+        }
+        ins=inside;
+      }
     }
-  });
+    if(ins) selPts.push(p);
+    if(p.sel!==ins){
+      p.sel=ins;
+      if(p.m){
+        const baseCol = (p.zone && zoneColors[p.zone]) ? zoneColors[p.zone] : '#f97316';
+        p.m.setStyle({fillColor:ins?'#ef4444':baseCol,fillOpacity:ins?0.95:0.8,radius:ins?5:3.2,weight:ins?1:0.4});
+      }
+    }
+  }
   renderList(selPts);
-  // Show/hide zone assign bar
   document.getElementById('zoneAssignBar').style.display = selPts.length ? 'block' : 'none';
   renderZoneQuickPills();
-
-  // Switch to results if we found something
+  // refresh visible dots so selected ones turn red
+  if(typeof map!=='undefined' && map.getZoom() >= DOT_ZOOM_MIN){ _lastDotKey=''; renderVisibleDots(); }
   if(selPts.length && document.getElementById('resultsPanel').style.display==='none'){
     document.getElementById('provPanel').style.display='none';
     document.getElementById('resultsPanel').style.display='flex';
@@ -2943,12 +3067,13 @@ function ptInPoly(ll,layer){
 }
 
 function resetMkr(){
-  allPts.forEach(p=>{
+  // Only restyle points that were actually selected — not all 894K
+  for(let i=0;i<allPts.length;i++){
+    const p=allPts[i];
+    if(!p.sel) continue;
     p.sel=false;
-    if(!p.m) return;
-    const col = (p.zone && zoneColors[p.zone]) ? zoneColors[p.zone] : '#f97316';
-    p.m.setStyle({fillColor:col,fillOpacity:0.78,radius:3.5,weight:0.8,color:'#fff',opacity:1});
-  });
+  }
+  if(typeof map!=='undefined' && map.getZoom() >= DOT_ZOOM_MIN){ _lastDotKey=''; renderVisibleDots(); }
   renderList([]);
 }
 
@@ -3133,7 +3258,7 @@ function renderList(pts, cityMode=false){
         const zCol = p.zone && zoneColors[p.zone] ? zoneColors[p.zone] : null;
         const zoneBadge = zCol ? `<span class="pc-zone" style="background:${zCol}22;color:${zCol};border:1px solid ${zCol}55;">${p.zone}</span>` : '';
         return `<div class="prow" data-lat="${p.lat}" data-lng="${p.lng}">
-          <span class="pc">${p.pc}</span>
+          <span class="pc">${p.pcRaw||p.pc}</span>
           <span class="pc-fsa">${p.fsa}</span>
           <span class="pc-city">${p.city}</span>
           ${zoneBadge}
@@ -3202,7 +3327,7 @@ function doExport(type){
   if(!selPts.length)return alert('No postal codes selected. Draw a shape first.');
   if(type==='csv'){
     const rows=[['Postal Code','FSA','Province','City','Zone','Latitude','Longitude','Address Count']];
-    selPts.forEach(p=>rows.push([p.pc,p.fsa,p.prov,p.city,p.zone||'',p.lat.toFixed(6),p.lng.toFixed(6),p.cnt||'']));
+    selPts.forEach(p=>rows.push([p.pcRaw||p.pc,p.fsa,p.prov,p.city,p.zone||'',p.lat.toFixed(6),p.lng.toFixed(6),p.cnt||'']));
     const a=document.createElement('a');
     a.href=URL.createObjectURL(new Blob([rows.map(r=>r.map(v=>`"${v}"`).join(',')).join('\n')],{type:'text/csv'}));
     a.download='postal_selection_'+new Date().toISOString().slice(0,10)+'.csv';a.click();
@@ -3796,7 +3921,7 @@ function renderCityResults(){
     ? `<div style="text-align:center;padding:6px;font-family:JetBrains Mono,monospace;font-size:10px;color:var(--muted)">Showing 500 of ${sorted.length.toLocaleString()} — export CSV for full list</div>`
     : '') + show.map(p=>`
     <div class="city-pc-row" data-lat="${p.lat}" data-lng="${p.lng}">
-      <span class="city-pc-code">${p.pc}</span>
+      <span class="city-pc-code">${p.pcRaw||p.pc}</span>
       <span class="city-pc-fsa">${p.fsa}</span>
       ${p.cnt?`<span class="city-pc-cnt">${p.cnt.toLocaleString()} addr</span>`:''}
     </div>`).join('');
@@ -3819,13 +3944,13 @@ function exportCityResults(type){
 
   if(type==='csv'){
     const rows=[['Postal Code','FSA','Province','City','Latitude','Longitude','Address Count']];
-    filtered.forEach(p=>rows.push([p.pc,p.fsa,p.prov,p.city,p.lat.toFixed(6),p.lng.toFixed(6),p.cnt||'']));
+    filtered.forEach(p=>rows.push([p.pcRaw||p.pc,p.fsa,p.prov,p.city,p.lat.toFixed(6),p.lng.toFixed(6),p.cnt||'']));
     const a=document.createElement('a');
     a.href=URL.createObjectURL(new Blob([rows.map(r=>r.map(v=>`"${v}"`).join(',')).join('\n')],{type:'text/csv'}));
     a.download='city_'+cityInput.value.replace(/\s+/g,'_')+'_'+new Date().toISOString().slice(0,10)+'.csv';
     a.click();
   } else if(type==='pc'){
-    cpCity([...new Set(filtered.map(p=>p.pc))].sort().join(', '),'⎘ Postal Codes',1);
+    cpCity([...new Set(filtered.map(p=>p.pcRaw||p.pc))].sort().join(', '),'⎘ Postal Codes',1);
   } else {
     cpCity([...new Set(filtered.map(p=>p.fsa))].sort().join(', '),'⎘ FSA Codes',2);
   }
@@ -3951,7 +4076,7 @@ function exportCityZones(){
       const e = idx[lc];
       if(!e) return;
       e.pts.forEach(p=>{
-        rows.push([z,p.pc,p.fsa,p.prov,p.city,p.lat.toFixed(6),p.lng.toFixed(6),p.cnt||'']);
+        rows.push([z,p.pcRaw||p.pc,p.fsa,p.prov,p.city,p.lat.toFixed(6),p.lng.toFixed(6),p.cnt||'']);
         total++; zc++;
       });
     });
