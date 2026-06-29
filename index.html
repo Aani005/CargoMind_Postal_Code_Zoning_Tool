@@ -530,19 +530,24 @@ input[type=text]:focus,.zone-assign-input:focus,#cutZoneLabel:focus{
     <!-- STEP 1: Upload -->
     <div class="panel" id="uploadPanel">
       <div>
-        <div class="slabel">1 — Upload your aggregated file</div>
-        <div class="drop" id="dropzone">
-          <input type="file" id="fileInput" accept=".xlsx,.xls,.csv">
-          <span class="drop-icon">📂</span>
-          <span class="drop-title">Drop postal_aggregated.csv here</span>
-          <span class="drop-sub">CSV or Excel · up to 800K rows</span>
+        <div class="slabel">Loading postal data…</div>
+        <div class="drop" id="autoLoadStatus" style="cursor:default;">
+          <span class="drop-icon" id="autoLoadIcon">🛰️</span>
+          <span class="drop-title" id="autoLoadTitle">Fetching Canada postal codes…</span>
+          <span class="drop-sub" id="autoLoadSub">This loads automatically — no upload needed</span>
+          <div style="margin-top:12px;height:6px;border-radius:6px;background:var(--border);overflow:hidden;">
+            <div id="autoLoadBar" style="height:100%;width:0%;background:linear-gradient(90deg,var(--accent),#ea580c);transition:width .3s;border-radius:6px;"></div>
+          </div>
         </div>
         <div class="file-ok" id="fileOk">✓ <span id="fileOkTxt"></span></div>
+        <!-- hidden legacy upload input kept for internal reuse only -->
+        <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" style="display:none;">
+        <div id="dropzone" style="display:none;"></div>
       </div>
       <div class="infobox">
         <strong>How this works:</strong><br>
-        Upload your <code>postal_aggregated.csv</code> → then optionally upload one or more <strong>zone sheets</strong> to colour-code areas by zone.<br><br>
-        Zone sheets just need a <code>Postal_Code</code> and <code>Zone</code> column — the rest is ignored.
+        All Canadian postal codes load automatically when the page opens. Use the drawing tools to select an area, or <strong>✂ Cut Zones</strong> to carve nested delivery zones and export them.<br><br>
+        Want to colour-code by zone? Use <strong>🗺 Zones</strong> in the toolbar to upload a zone sheet.
       </div>
     </div>
 
@@ -577,6 +582,15 @@ input[type=text]:focus,.zone-assign-input:focus,#cutZoneLabel:focus{
           <span class="city-result-count" id="cityResultCount"></span>
         </div>
         <div class="city-prov-tabs" id="cityProvTabs"></div>
+
+        <!-- Assign this city to a zone -->
+        <div style="display:flex;gap:6px;align-items:center;padding:8px 0;border-top:1px solid var(--border);border-bottom:1px solid var(--border);margin:4px 0;">
+          <input type="text" id="cityZoneInput" placeholder="Zone (e.g. 1, 2, North…)" maxlength="20"
+            style="flex:1;padding:7px 10px;border:1.5px solid rgba(249,115,22,.35);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;background:var(--panel2);color:var(--text);"
+            onkeydown="if(event.key==='Enter')assignCityToZone()">
+          <button class="city-go-btn" onclick="assignCityToZone()" style="background:var(--green);">+ Add to Zone</button>
+        </div>
+
         <div class="city-pc-list" id="cityPcList"></div>
         <div class="city-export-row">
           <button class="exp" onclick="exportCityResults('csv')">↓ CSV</button>
@@ -584,8 +598,22 @@ input[type=text]:focus,.zone-assign-input:focus,#cutZoneLabel:focus{
           <button class="exp" onclick="exportCityResults('fsa')">⎘ FSA Codes</button>
         </div>
       </div>
+
+      <!-- City → Zone assignments -->
+      <div id="cityZoneBuilder" style="display:none;margin-top:12px;border-top:1px solid var(--border);padding-top:10px;">
+        <div style="font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;">
+          <span>🗺 City Zones</span>
+          <span id="cityZoneSummary" style="color:var(--accent);"></span>
+        </div>
+        <div id="cityZoneList" style="display:flex;flex-direction:column;gap:6px;"></div>
+        <div style="display:flex;flex-direction:column;gap:6px;margin-top:10px;">
+          <button class="exp" style="background:var(--green);color:#fff;border:none;font-weight:700;" onclick="exportCityZones()">↓ Export all city zones (CSV)</button>
+          <button class="exp" style="border:1px solid rgba(239,68,68,.3);color:rgba(239,68,68,.85);background:transparent;" onclick="clearCityZones()">✕ Clear all city zones</button>
+        </div>
+      </div>
+
       <div class="infobox" id="cityHint">
-        Type any city name to instantly find all postal codes in that city — across all loaded provinces.
+        Type a city name to find all its postal codes. Add a <strong>Zone</strong> and click <strong>+ Add to Zone</strong> to build city-based delivery zones, then export them with a Zone column.
       </div>
     </div>
 
@@ -980,7 +1008,7 @@ input[type=text]:focus,.zone-assign-input:focus,#cutZoneLabel:focus{
   <!-- MAP -->
   <div class="mapwrap">
     <div id="map"></div>
-    <div class="drawtip" id="drawtip">Upload your file to begin</div>
+    <div class="drawtip" id="drawtip">Loading postal data…</div>
     <div class="loading" id="loadingEl">
       <div class="spinner"></div>
       <div class="lmsg" id="lmsg">Processing...</div>
@@ -1067,6 +1095,270 @@ tileLayers.forEach(t=>{
   layer.addTo(map);
 });
 drawn = new L.FeatureGroup().addTo(map);
+
+// ════════════════════════════════════════════════════════════
+//  AUTO-LOAD: fetch + decompress bundled postal data on page open
+//  No upload step. Loads every province onto the map automatically.
+// ════════════════════════════════════════════════════════════
+const AUTO_DATA_GZ  = 'postal_data.csv.gz';  // preferred (small, ~8MB)
+const AUTO_DATA_CSV = 'postal_data.csv';     // fallback if .gz not present
+
+function setAutoStatus(title, sub, pct, icon){
+  const t=document.getElementById('autoLoadTitle'), s=document.getElementById('autoLoadSub'),
+        b=document.getElementById('autoLoadBar'),  ic=document.getElementById('autoLoadIcon');
+  if(t&&title!=null) t.textContent=title;
+  if(s&&sub!=null) s.textContent=sub;
+  if(b&&pct!=null) b.style.width=Math.max(0,Math.min(100,pct))+'%';
+  if(ic&&icon!=null) ic.textContent=icon;
+}
+
+async function fetchPostalText(){
+  // Try gzipped first
+  try{
+    const res = await fetch(AUTO_DATA_GZ, {cache:'force-cache'});
+    if(res.ok){
+      setAutoStatus('Decompressing data…', 'Unpacking ~8 MB → ~41 MB', 45, '📦');
+      if('DecompressionStream' in window){
+        const ds = new DecompressionStream('gzip');
+        const stream = res.body.pipeThrough(ds);
+        const text = await new Response(stream).text();
+        return text;
+      } else {
+        // Browser lacks DecompressionStream — fall back to plain CSV
+        throw new Error('no DecompressionStream');
+      }
+    }
+  }catch(e){ /* fall through to plain CSV */ }
+
+  // Fallback: plain CSV
+  setAutoStatus('Fetching postal codes…', 'Downloading data file', 30, '🛰️');
+  const res2 = await fetch(AUTO_DATA_CSV, {cache:'force-cache'});
+  if(!res2.ok) throw new Error('Could not load '+AUTO_DATA_CSV+' (HTTP '+res2.status+')');
+  return await res2.text();
+}
+
+async function autoLoadData(){
+  try{
+    setAutoStatus('Fetching Canada postal codes…', 'Downloading ~8 MB', 15, '🛰️');
+    const csvText = await fetchPostalText();
+
+    setAutoStatus('Parsing postal codes…', 'Reading rows', 70, '🧮');
+    await new Promise((resolve)=>{
+      Papa.parse(csvText, {
+        header:true, skipEmptyLines:true,
+        complete:r=>{ onData(r.data, 'canada_postal_codes.csv'); resolve(); },
+        error:e=>{ console.error(e); resolve(); }
+      });
+    });
+
+    // onData populated fullData + showed the province grid.
+    // Now auto-load EVERY province onto the map, no clicks needed.
+    setAutoStatus('Rendering map…', 'Placing markers', 90, '🗺️');
+    await autoLoadAllProvinces();
+
+  }catch(err){
+    console.error(err);
+    setAutoStatus('Could not auto-load data', String(err.message||err), 0, '⚠️');
+    document.getElementById('autoLoadSub').innerHTML =
+      'Auto-load failed. Make sure <code>postal_data.csv.gz</code> (or <code>postal_data.csv</code>) sits next to this page. '+
+      'See console for details.';
+  }
+}
+
+// Load all postal data into memory (FAST — no per-point map markers).
+// City Search + City Zoning + draw-selection all run off this data.
+function autoLoadAllProvinces(){
+  return new Promise((resolve)=>{
+    const codes = Object.keys(fullData).filter(c=>fullData[c] && fullData[c].length);
+    if(!codes.length){ resolve(); return; }
+
+    // Switch UI straight to the map/results view
+    document.getElementById('uploadPanel').style.display='none';
+    document.getElementById('provPanel').style.display='none';
+    document.getElementById('resultsPanel').style.display='flex';
+    document.getElementById('toolbar').style.display='flex';
+
+    allPts = [];
+    loadedProvs = {};
+    let ci = 0;
+
+    function nextProv(){
+      if(ci >= codes.length){
+        rebuildAllPts();
+        const sp=document.getElementById('spill');
+        countUpPill(sp, allPts.length, ' postal codes');
+        sp.classList.add('on');
+        try{ map.setView([56,-96],4); }catch(e){}
+        hideLoad();
+        tip('Data ready — use 🔍 City Search to build city zones, or draw a shape');
+        renderList([]);
+        resolve();
+        return;
+      }
+      const code = codes[ci++];
+      const rows = fullData[code];
+      setAutoStatus('Indexing '+code+'…', (ci)+' / '+codes.length+' provinces', 90+(ci/codes.length)*10, '🧮');
+      const pts = [];
+      let i = 0;
+      const CHUNK = 20000;
+      function chunk(){
+        const end = Math.min(i+CHUNK, rows.length);
+        for(; i<end; i++){
+          const row = rows[i];
+          let lat,lng;
+          try{ const r=toLL(row.rawX,row.rawY); lat=r.lat; lng=r.lng; }catch(e){ continue; }
+          if(isNaN(lat)||isNaN(lng)||lat<40||lat>85||lng<-145||lng>-50) continue;
+          if(!row.pc || row.pc.length<3) continue;
+          const zone = row.zone || zoneSheetLookup[row.pc] || '';
+          pts.push({
+            pc:row.pc, fsa:row.pc.substring(0,3), prov:code,
+            city:row.city, cnt:row.cnt, lat, lng,
+            m:null, sel:false, zone, zoneSource:row.zoneSource||''
+          });
+        }
+        if(i<rows.length){ setTimeout(chunk,0); }
+        else { loadedProvs[code]=pts; setTimeout(nextProv,0); }
+      }
+      chunk();
+    }
+    nextProv();
+  });
+}
+
+// Auto variant of doLoadProvince: renders ALL rows (no sampling cap),
+// relies on marker clustering for performance, and calls done() when finished.
+function doLoadProvinceAuto(code, rows, done){
+  const label = code;
+  showLoad('Loading '+label+' — 0%', rows.length.toLocaleString()+' postal codes');
+
+  if(provClusters[code]){
+    map.removeLayer(provClusters[code]);
+    delete provClusters[code];
+    if(loadedProvs[code]) delete loadedProvs[code];
+  }
+
+  const pts=[];
+  const CHUNK=4000;
+  let idx=0;
+  const renderer=L.svg({padding:0.5});
+
+  function makePopupHTML(pc, fsa, zone, markerColor, zoneSource, city, prov, cnt){
+    const srcRow = zoneSource ? `<div class="pc-popup-row pc-popup-source">📄 ${zoneSource}</div>` : '';
+    return `<div class="pc-popup-inner">
+      <div class="pc-popup-code">${pc}</div>
+      <div class="pc-popup-row">FSA: <b>${fsa}</b></div>
+      ${zone?`<div class="pc-popup-row">Zone: <b style="color:${markerColor}">${zone}</b></div>`:''}
+      ${srcRow}
+      <div class="pc-popup-row pc-popup-city">${city?city+', ':''}<b>${prov}</b>${cnt?' · '+cnt.toLocaleString()+' addr':''}</div>
+    </div>`;
+  }
+
+  const cluster = L.markerClusterGroup({
+    chunkedLoading:true,chunkSize:4000,chunkDelay:30,
+    maxClusterRadius:60,spiderfyOnMaxZoom:true,
+    showCoverageOnHover:false,zoomToBoundsOnClick:true,
+    iconCreateFunction:clusterIconFactory()
+  });
+
+  function processChunk(){
+    const end=Math.min(idx+CHUNK,rows.length);
+    for(let i=idx;i<end;i++){
+      const row=rows[i];
+      let lat,lng;
+      try{const r=toLL(row.rawX,row.rawY);lat=r.lat;lng=r.lng;}catch(e){continue;}
+      if(lat<40||lat>85||lng<-145||lng>-50||isNaN(lat)||isNaN(lng)) continue;
+      if(row.pc.length<3) continue;
+      const fsa=row.pc.substring(0,3);
+      const zone = row.zone || zoneSheetLookup[row.pc] || '';
+      if(zone && !zoneColors[zone]){
+        const cidx = Object.keys(zoneColors).length % ZONE_PALETTE.length;
+        zoneColors[zone] = ZONE_PALETTE[cidx];
+      }
+      const markerColor = (zone && zoneColors[zone]) ? zoneColors[zone] : '#f97316';
+      const m=L.circleMarker([lat,lng],{
+        renderer,radius:5,fillColor:markerColor,color:'#fff',weight:1,fillOpacity:0.9,
+        _zone: zone || '__none__'
+      });
+      m.bindTooltip(`<b>${row.pc}</b>${zone?` · Zone ${zone}`:''}`,{sticky:true,direction:'top',offset:[0,-4]});
+      const zoneSource = row.zoneSource || (zone ? '(main file)' : '');
+      m.on('click', function(e){
+        L.popup({maxWidth:260,className:'pc-popup',closeButton:true,autoPan:true})
+          .setLatLng(e.latlng)
+          .setContent(makePopupHTML(row.pc,fsa,zone,markerColor,zoneSource,row.city,code,row.cnt))
+          .openOn(map);
+        L.DomEvent.stopPropagation(e);
+      });
+      pts.push({pc:row.pc,fsa,prov:code,city:row.city,cnt:row.cnt,lat,lng,m,sel:false,zone,zoneSource});
+      cluster.addLayer(m);
+    }
+    idx=end;
+    const pct=Math.round((idx/rows.length)*100);
+    const lmsg=document.getElementById('lmsg'); if(lmsg) lmsg.textContent=`Loading ${label} — ${pct}%`;
+    const lsub=document.getElementById('lsub'); if(lsub) lsub.textContent=`${pts.length.toLocaleString()} points added`;
+
+    if(idx<rows.length){
+      setTimeout(processChunk,0);
+    } else {
+      provClusters[code]=cluster;
+      map.addLayer(cluster);
+      loadedProvs[code]=pts;
+      rebuildAllPts();
+      if(Object.keys(zoneSheetLookup).length) applyZoneLookupToData();
+      updateLoadedStrip();
+      hideLoad();
+      done && done();
+    }
+  }
+  processChunk();
+}
+
+// Shared cluster icon builder (pie-chart by zone, else solid disc)
+function clusterIconFactory(){
+  return function(c){
+    const n = c.getChildCount();
+    const sz = n>1000?50:n>100?42:34;
+    const half = sz/2;
+    const label = n>999?Math.round(n/1000)+'k':n;
+    const zoneCounts = {};
+    c.getAllChildMarkers().forEach(m=>{
+      const z = (m.options && m.options._zone) || '__none__';
+      zoneCounts[z] = (zoneCounts[z]||0) + 1;
+    });
+    const entries = Object.entries(zoneCounts).sort((a,b)=>b[1]-a[1]);
+    const hasZones = entries.some(([z])=>z!=='__none__');
+    let svgInner = '';
+    if(hasZones && entries.length > 0){
+      let startAngle = -Math.PI/2; const r = half - 2;
+      entries.forEach(([z, cnt])=>{
+        const col = (z!=='__none__' && zoneColors[z]) ? zoneColors[z] : '#888888';
+        const slice = (cnt/n) * 2 * Math.PI;
+        const endAngle = startAngle + slice;
+        const x1 = half + r*Math.cos(startAngle), y1 = half + r*Math.sin(startAngle);
+        const x2 = half + r*Math.cos(endAngle),   y2 = half + r*Math.sin(endAngle);
+        const large = slice > Math.PI ? 1 : 0;
+        if(entries.length === 1){ svgInner += `<circle cx="${half}" cy="${half}" r="${r}" fill="${col}"/>`; }
+        else { svgInner += `<path d="M${half},${half} L${x1},${y1} A${r},${r} 0 ${large},1 ${x2},${y2} Z" fill="${col}"/>`; }
+        startAngle = endAngle;
+      });
+      svgInner += `<circle cx="${half}" cy="${half}" r="${half*0.52}" fill="rgba(15,17,23,0.82)"/>`;
+      svgInner += `<text x="${half}" y="${half}" text-anchor="middle" dominant-baseline="central" font-family="JetBrains Mono,monospace" font-weight="700" font-size="${half*0.52}px" fill="#ffffff">${label}</text>`;
+    } else {
+      const col = n>1000?'#7c3aed':n>100?'#ef4444':'#f97316';
+      svgInner += `<circle cx="${half}" cy="${half}" r="${half-2}" fill="${col}"/>`;
+      svgInner += `<text x="${half}" y="${half}" text-anchor="middle" dominant-baseline="central" font-family="JetBrains Mono,monospace" font-weight="700" font-size="${half*0.52}px" fill="#ffffff">${label}</text>`;
+    }
+    const svg = `<svg width="${sz}" height="${sz}" viewBox="0 0 ${sz} ${sz}" xmlns="http://www.w3.org/2000/svg" style="filter:drop-shadow(0 2px 4px rgba(0,0,0,0.4))">${svgInner}</svg>`;
+    return L.divIcon({html:svg, className:'', iconSize:[sz,sz], iconAnchor:[half,half]});
+  };
+}
+
+// Kick it off once the page is ready
+if(document.readyState==='loading'){
+  document.addEventListener('DOMContentLoaded', autoLoadData);
+} else {
+  autoLoadData();
+}
+
 
 // ── LAMBERT → WGS84 ──
 function lam2wgs(x,y){
@@ -2085,9 +2377,12 @@ function doLoadProvince(code, rows, label){
   setTimeout(processChunk,80);
 }
 
+function arrMin(a){let m=Infinity;for(let i=0;i<a.length;i++)if(a[i]<m)m=a[i];return m;}
+function arrMax(a){let m=-Infinity;for(let i=0;i<a.length;i++)if(a[i]>m)m=a[i];return m;}
 function rebuildAllPts(){
   allPts=[];
-  Object.values(loadedProvs).forEach(pts=>allPts.push(...pts));
+  // Use a loop (not push(...spread)) — spreading 100Ks of items overflows the call stack
+  Object.values(loadedProvs).forEach(pts=>{ for(let i=0;i<pts.length;i++) allPts.push(pts[i]); });
 }
 
 // ── ZONE FUNCTIONS ──
@@ -2619,8 +2914,10 @@ function compute(){
       :ptInPoly(ll,drawnLayer);
     p.sel=ins;
     if(ins)selPts.push(p);
-    const baseCol = (p.zone && zoneColors[p.zone]) ? zoneColors[p.zone] : '#f97316';
-    p.m.setStyle({fillColor:ins?'#ef4444':baseCol,fillOpacity:ins?0.95:0.78,radius:ins?5.5:3.5,weight:ins?1.2:0.8});
+    if(p.m){
+      const baseCol = (p.zone && zoneColors[p.zone]) ? zoneColors[p.zone] : '#f97316';
+      p.m.setStyle({fillColor:ins?'#ef4444':baseCol,fillOpacity:ins?0.95:0.78,radius:ins?5.5:3.5,weight:ins?1.2:0.8});
+    }
   });
   renderList(selPts);
   // Show/hide zone assign bar
@@ -2648,6 +2945,7 @@ function ptInPoly(ll,layer){
 function resetMkr(){
   allPts.forEach(p=>{
     p.sel=false;
+    if(!p.m) return;
     const col = (p.zone && zoneColors[p.zone]) ? zoneColors[p.zone] : '#f97316';
     p.m.setStyle({fillColor:col,fillOpacity:0.78,radius:3.5,weight:0.8,color:'#fff',opacity:1});
   });
@@ -2750,7 +3048,7 @@ function applyCityFilter(cityName){
   // Zoom to city
   if(matching.length){
     const lats=matching.map(p=>p.lat), lngs=matching.map(p=>p.lng);
-    map.fitBounds([[Math.min(...lats),Math.min(...lngs)],[Math.max(...lats),Math.max(...lngs)]],{padding:[60,60],maxZoom:13});
+    map.fitBounds([[arrMin(lats),arrMin(lngs)],[arrMax(lats),arrMax(lngs)]],{padding:[60,60],maxZoom:13});
   }
 
   // Highlight city markers
@@ -3371,6 +3669,7 @@ function toggleCitySearch(){
     btn.textContent = '✕ Close Search';
     panel.style.display = 'flex';
     res.style.display   = 'none';
+    renderCityZoneList();
     document.getElementById('citySearchInput').focus();
   } else {
     btn.classList.remove('city-on');
@@ -3463,7 +3762,7 @@ function selectCity(cityName){
   // Fly to city
   if(entry.pts.length){
     const lats=entry.pts.map(p=>p.lat), lngs=entry.pts.map(p=>p.lng);
-    map.fitBounds([[Math.min(...lats),Math.min(...lngs)],[Math.max(...lats),Math.max(...lngs)]],{padding:[60,60],maxZoom:13});
+    map.fitBounds([[arrMin(lats),arrMin(lngs)],[arrMax(lats),arrMax(lngs)]],{padding:[60,60],maxZoom:13});
   }
 }
 
@@ -3540,6 +3839,133 @@ function cpCity(text,label,idx){
     setTimeout(()=>btns[idx].textContent=orig,1800);
   }).catch(()=>alert(text));
 }
+
+// ════════════════════════════════════════════════════════════
+//  CITY ZONING — assign searched cities to zones, export by zone
+// ════════════════════════════════════════════════════════════
+// cityZones: { zoneLabel: { cities: Set<lowercaseCityName>, displayNames: {lc:Display} } }
+let cityZones = {};
+
+function assignCityToZone(){
+  const cityName = (document.getElementById('cityResultName').textContent || '').trim();
+  if(!cityName){ alert('Search and select a city first.'); return; }
+  const zEl = document.getElementById('cityZoneInput');
+  let zone = (zEl.value || '').trim();
+  if(!zone){ zone = String(Object.keys(cityZones).length + 1); }
+
+  const lc = cityName.toLowerCase();
+  if(!cityZones[zone]) cityZones[zone] = { cities:new Set(), displayNames:{} };
+
+  // If this city is already in another zone, move it (a city belongs to one zone)
+  Object.keys(cityZones).forEach(z=>{
+    if(z!==zone && cityZones[z].cities.has(lc)){
+      cityZones[z].cities.delete(lc);
+      delete cityZones[z].displayNames[lc];
+      if(cityZones[z].cities.size===0) delete cityZones[z];
+    }
+  });
+
+  cityZones[zone].cities.add(lc);
+  cityZones[zone].displayNames[lc] = cityName;
+
+  zEl.value='';
+  renderCityZoneList();
+  tip('Added '+cityName+' to Zone '+zone);
+}
+
+function cityZoneStats(zone){
+  // count postal codes across all cities in this zone, using the live index
+  const idx = buildCityIndex();
+  let pcCount = 0;
+  cityZones[zone].cities.forEach(lc=>{
+    const e = idx[lc];
+    if(e) pcCount += e.pts.length;
+  });
+  return pcCount;
+}
+
+function renderCityZoneList(){
+  const builder = document.getElementById('cityZoneBuilder');
+  const list    = document.getElementById('cityZoneList');
+  const summary = document.getElementById('cityZoneSummary');
+  const zones = Object.keys(cityZones);
+  if(!zones.length){ builder.style.display='none'; list.innerHTML=''; summary.textContent=''; return; }
+  builder.style.display='block';
+
+  const palette = (typeof ZONE_PALETTE!=='undefined') ? ZONE_PALETTE :
+    ['#f97316','#3b82f6','#22c55e','#a855f7','#ef4444','#06b6d4','#eab308','#ec4899'];
+
+  let totalCities=0;
+  zones.sort((a,b)=> a.localeCompare(b, undefined, {numeric:true}));
+  list.innerHTML = zones.map((z,zi)=>{
+    const color = palette[zi % palette.length];
+    const cities = [...cityZones[z].cities].map(lc=>cityZones[z].displayNames[lc]).sort();
+    totalCities += cities.length;
+    const pcCount = cityZoneStats(z);
+    const chips = cities.map(name=>{
+      const lc = name.toLowerCase();
+      return `<span style="display:inline-flex;align-items:center;gap:4px;background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:2px 6px 2px 8px;font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--text);margin:2px;">
+        ${name}
+        <span onclick="removeCityFromZone('${z.replace(/'/g,"\\'")}','${lc.replace(/'/g,"\\'")}')" style="cursor:pointer;color:var(--muted);font-weight:700;padding:0 2px;" title="Remove">✕</span>
+      </span>`;
+    }).join('');
+    return `<div style="background:var(--panel2);border:1px solid var(--border);border-left:3px solid ${color};border-radius:6px;padding:8px 10px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+        <span style="font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;color:var(--text);">
+          <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${color};margin-right:5px;"></span>Zone ${z}
+        </span>
+        <span style="font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--muted);">${cities.length} cit${cities.length===1?'y':'ies'} · ${pcCount.toLocaleString()} PC</span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;">${chips}</div>
+    </div>`;
+  }).join('');
+  summary.textContent = zones.length+(zones.length===1?' zone':' zones')+' · '+totalCities+' cities';
+}
+
+function removeCityFromZone(zone, lc){
+  if(!cityZones[zone]) return;
+  cityZones[zone].cities.delete(lc);
+  delete cityZones[zone].displayNames[lc];
+  if(cityZones[zone].cities.size===0) delete cityZones[zone];
+  renderCityZoneList();
+}
+
+function clearCityZones(){
+  const n = Object.keys(cityZones).length;
+  if(n && !confirm('Remove all '+n+' city zone'+(n===1?'':'s')+'?')) return;
+  cityZones = {};
+  renderCityZoneList();
+}
+
+function exportCityZones(){
+  const zones = Object.keys(cityZones);
+  if(!zones.length){ alert('Add at least one city to a zone first.'); return; }
+  const idx = buildCityIndex();
+  const rows = [['Zone','Postal Code','FSA','Province','City','Latitude','Longitude','Address Count']];
+  let total = 0;
+  const summary = [];
+  zones.sort((a,b)=> a.localeCompare(b, undefined, {numeric:true}));
+  zones.forEach(z=>{
+    let zc = 0;
+    [...cityZones[z].cities].sort().forEach(lc=>{
+      const e = idx[lc];
+      if(!e) return;
+      e.pts.forEach(p=>{
+        rows.push([z,p.pc,p.fsa,p.prov,p.city,p.lat.toFixed(6),p.lng.toFixed(6),p.cnt||'']);
+        total++; zc++;
+      });
+    });
+    summary.push('Zone '+z+': '+zc.toLocaleString());
+  });
+  if(!total){ alert('No postal codes found for the assigned cities.'); return; }
+  const csv = rows.map(r=>r.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(',')).join('\n');
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+  a.download='city_zones_'+new Date().toISOString().slice(0,10)+'.csv';
+  a.click();
+  tip('Exported '+total.toLocaleString()+' codes — '+summary.join(' · '));
+}
+
 function showLoad(m,s=''){
   document.getElementById('lmsg').textContent=m;
   document.getElementById('lsub').textContent=s;
